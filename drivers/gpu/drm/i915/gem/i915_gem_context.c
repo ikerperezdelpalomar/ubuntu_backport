@@ -642,7 +642,6 @@ static void context_close(struct i915_gem_context *ctx)
 	 * context close.
 	 */
 	kill_context(ctx);
-
 	i915_gem_context_put(ctx);
 }
 

@@ -362,7 +362,7 @@ int intel_dp_aux_init_backlight_funcs(struct intel_connector *intel_connector)
 				      DP_QUIRK_FORCE_DPCD_BACKLIGHT);
 
 	if (i915->params.enable_dpcd_backlight == 0 ||
-	    (!force_dpcd && !intel_dp_aux_display_control_capable(intel_connector)))
+	    !intel_dp_aux_display_control_capable(intel_connector))
 		return -ENODEV;
 
 	/*
@@ -371,7 +371,9 @@ int intel_dp_aux_init_backlight_funcs(struct intel_connector *intel_connector)
 	 */
 	if (i915->vbt.backlight.type !=
 	    INTEL_BACKLIGHT_VESA_EDP_AUX_INTERFACE &&
-	    i915->params.enable_dpcd_backlight != 1 && !force_dpcd) {
+	    i915->params.enable_dpcd_backlight != 1 &&
+	    !drm_dp_has_quirk(&intel_dp->desc, intel_dp->edid_quirks,
+			      DP_QUIRK_FORCE_DPCD_BACKLIGHT)) {
 		drm_info(&i915->drm,
 			 "Panel advertises DPCD backlight support, but "
 			 "VBT disagrees. If your backlight controls "
