@@ -609,6 +609,58 @@ static u8 intel_dp_dsc_get_slice_count(struct intel_dp *intel_dp,
 	return 0;
 }
 
+static enum intel_output_format
+intel_dp_output_format(struct drm_connector *connector,
+		       const struct drm_display_mode *mode)
+{
+	struct intel_dp *intel_dp = intel_attached_dp(to_intel_connector(connector));
+	const struct drm_display_info *info = &connector->display_info;
+
+	if (!connector->ycbcr_420_allowed ||
+	    !drm_mode_is_420_only(info, mode))
+		return INTEL_OUTPUT_FORMAT_RGB;
+
+	if (intel_dp->dfp.rgb_to_ycbcr &&
+	    intel_dp->dfp.ycbcr_444_to_420)
+		return INTEL_OUTPUT_FORMAT_RGB;
+
+	if (intel_dp->dfp.ycbcr_444_to_420)
+		return INTEL_OUTPUT_FORMAT_YCBCR444;
+	else
+		return INTEL_OUTPUT_FORMAT_YCBCR420;
+}
+
+int intel_dp_min_bpp(enum intel_output_format output_format)
+{
+	if (output_format == INTEL_OUTPUT_FORMAT_RGB)
+		return 6 * 3;
+	else
+		return 8 * 3;
+}
+
+static int intel_dp_output_bpp(enum intel_output_format output_format, int bpp)
+{
+	/*
+	 * bpp value was assumed to RGB format. And YCbCr 4:2:0 output
+	 * format of the number of bytes per pixel will be half the number
+	 * of bytes of RGB pixel.
+	 */
+	if (output_format == INTEL_OUTPUT_FORMAT_YCBCR420)
+		bpp /= 2;
+
+	return bpp;
+}
+
+static int
+intel_dp_mode_min_output_bpp(struct drm_connector *connector,
+			     const struct drm_display_mode *mode)
+{
+	enum intel_output_format output_format =
+		intel_dp_output_format(connector, mode);
+
+	return intel_dp_output_bpp(output_format, intel_dp_min_bpp(output_format));
+}
+
 static bool intel_dp_hdisplay_bad(struct drm_i915_private *dev_priv,
 				  int hdisplay)
 {
@@ -4183,12 +4235,42 @@ void intel_dp_configure_protocol_converter(struct intel_dp *intel_dp,
 			    enableddisabled(intel_dp->dfp.ycbcr_444_to_420));
 
 	tmp = 0;
+	if (intel_dp->dfp.rgb_to_ycbcr) {
+		bool bt2020, bt709;
 
-	if (drm_dp_dpcd_writeb(&intel_dp->aux,
-			       DP_PROTOCOL_CONVERTER_CONTROL_2, tmp) <= 0)
+		/*
+		 * FIXME: Currently if userspace selects BT2020 or BT709, but PCON supports only
+		 * RGB->YCbCr for BT601 colorspace, we go ahead with BT601, as default.
+		 *
+		 */
+		tmp = DP_CONVERSION_BT601_RGB_YCBCR_ENABLE;
+
+		bt2020 = drm_dp_downstream_rgb_to_ycbcr_conversion(intel_dp->dpcd,
+								   intel_dp->downstream_ports,
+								   DP_DS_HDMI_BT2020_RGB_YCBCR_CONV);
+		bt709 = drm_dp_downstream_rgb_to_ycbcr_conversion(intel_dp->dpcd,
+								  intel_dp->downstream_ports,
+								  DP_DS_HDMI_BT709_RGB_YCBCR_CONV);
+		switch (crtc_state->infoframes.vsc.colorimetry) {
+		case DP_COLORIMETRY_BT2020_RGB:
+		case DP_COLORIMETRY_BT2020_YCC:
+			if (bt2020)
+				tmp = DP_CONVERSION_BT2020_RGB_YCBCR_ENABLE;
+			break;
+		case DP_COLORIMETRY_BT709_YCC:
+		case DP_COLORIMETRY_XVYCC_709:
+			if (bt709)
+				tmp = DP_CONVERSION_BT709_RGB_YCBCR_ENABLE;
+			break;
+		default:
+			break;
+		}
+	}
+
+	if (drm_dp_pcon_convert_rgb_to_ycbcr(&intel_dp->aux, tmp) < 0)
 		drm_dbg_kms(&i915->drm,
-			    "Failed to set protocol converter YCbCr 4:2:2 conversion mode to %s\n",
-			    enableddisabled(false));
+			   "Failed to set protocol converter RGB->YCbCr conversion mode to %s\n",
+			   enableddisabled(tmp ? true : false));
 }
 
 static void intel_enable_dp(struct intel_atomic_state *state,
@@ -4229,6 +4311,8 @@ static void intel_enable_dp(struct intel_atomic_state *state,
 
 	intel_dp_set_power(intel_dp, DP_SET_POWER_D0);
 	intel_dp_configure_protocol_converter(intel_dp, pipe_config);
+	intel_dp_check_frl_training(intel_dp);
+	intel_dp_pcon_dsc_configure(intel_dp, pipe_config);
 	intel_dp_start_link_train(intel_dp, pipe_config);
 	intel_dp_stop_link_train(intel_dp, pipe_config);
 
@@ -6651,7 +6735,7 @@ intel_dp_update_420(struct intel_dp *intel_dp)
 {
 	struct drm_i915_private *i915 = dp_to_i915(intel_dp);
 	struct intel_connector *connector = intel_dp->attached_connector;
-	bool is_branch, ycbcr_420_passthrough, ycbcr_444_to_420;
+	bool is_branch, ycbcr_420_passthrough, ycbcr_444_to_420, rgb_to_ycbcr;
 
 	/* No YCbCr output support on gmch platforms */
 	if (HAS_GMCH(i915))
@@ -6671,14 +6755,26 @@ intel_dp_update_420(struct intel_dp *intel_dp)
 	ycbcr_444_to_420 =
 		drm_dp_downstream_444_to_420_conversion(intel_dp->dpcd,
 							intel_dp->downstream_ports);
+	rgb_to_ycbcr = drm_dp_downstream_rgb_to_ycbcr_conversion(intel_dp->dpcd,
+								 intel_dp->downstream_ports,
+								 DP_DS_HDMI_BT601_RGB_YCBCR_CONV ||
+								 DP_DS_HDMI_BT709_RGB_YCBCR_CONV ||
+								 DP_DS_HDMI_BT2020_RGB_YCBCR_CONV);
 
 	if (INTEL_GEN(i915) >= 11) {
+		/* Let PCON convert from RGB->YCbCr if possible */
+		if (is_branch && rgb_to_ycbcr && ycbcr_444_to_420) {
+			intel_dp->dfp.rgb_to_ycbcr = true;
+			intel_dp->dfp.ycbcr_444_to_420 = true;
+			connector->base.ycbcr_420_allowed = true;
+		} else {
 		/* Prefer 4:2:0 passthrough over 4:4:4->4:2:0 conversion */
-		intel_dp->dfp.ycbcr_444_to_420 =
-			ycbcr_444_to_420 && !ycbcr_420_passthrough;
+			intel_dp->dfp.ycbcr_444_to_420 =
+				ycbcr_444_to_420 && !ycbcr_420_passthrough;
 
-		connector->base.ycbcr_420_allowed =
-			!is_branch || ycbcr_444_to_420 || ycbcr_420_passthrough;
+			connector->base.ycbcr_420_allowed =
+				!is_branch || ycbcr_444_to_420 || ycbcr_420_passthrough;
+		}
 	} else {
 		/* 4:4:4->4:2:0 conversion is the only way */
 		intel_dp->dfp.ycbcr_444_to_420 = ycbcr_444_to_420;
@@ -6687,8 +6783,9 @@ intel_dp_update_420(struct intel_dp *intel_dp)
 	}
 
 	drm_dbg_kms(&i915->drm,
-		    "[CONNECTOR:%d:%s] YCbCr 4:2:0 allowed? %s, YCbCr 4:4:4->4:2:0 conversion? %s\n",
+		    "[CONNECTOR:%d:%s] RGB->YcbCr conversion? %s, YCbCr 4:2:0 allowed? %s, YCbCr 4:4:4->4:2:0 conversion? %s\n",
 		    connector->base.base.id, connector->base.name,
+		    yesno(intel_dp->dfp.rgb_to_ycbcr),
 		    yesno(connector->base.ycbcr_420_allowed),
 		    yesno(intel_dp->dfp.ycbcr_444_to_420));
 }
